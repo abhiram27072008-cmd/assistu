@@ -6,3 +6,4 @@ python-docx
 openpyxl
 python-pptx
 fpdf2
+streamlit-js-eval
