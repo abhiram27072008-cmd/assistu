@@ -152,9 +152,8 @@ if "history" not in st.session_state:
 if "uploader_key" not in st.session_state:
     st.session_state.uploader_key = 0
 
-# ---------------------------------------------------------------- sidebar
-with st.sidebar:
-    st.header("Attachments")
+# ---------------------------------------------------------------- tools (main screen)
+with st.expander("📎 Upload files  •  📷 Camera", expanded=False):
     st.caption("Photos, PDF, Word (.docx), Excel (.xlsx), PowerPoint (.pptx), txt, csv")
     uploaded = st.file_uploader(
         "Upload files",
@@ -167,15 +166,22 @@ with st.sidebar:
     if use_camera:
         photo = st.camera_input("Take a picture", key=f"cam_{st.session_state.uploader_key}")
 
-    st.divider()
-    image_mode = st.toggle("🎨 Image generation mode")
-    st.caption("When on, your message is used as an image prompt. "
-               "Attach a photo to edit it instead.")
-
-    if st.button("🗑️ Clear chat"):
+col_a, col_b = st.columns([3, 2])
+with col_a:
+    image_mode = st.toggle("🎨 Image generation mode",
+                           help="When on, your message is used as an image prompt. "
+                                "Attach a photo to edit it instead.")
+with col_b:
+    if st.button("🗑️ Clear chat", use_container_width=True):
         st.session_state.history = []
         st.session_state.uploader_key += 1
         st.rerun()
+
+n_attached = len(uploaded or []) + (1 if photo is not None else 0)
+if n_attached:
+    st.info(f"📎 {n_attached} attachment(s) ready. They will be sent with your next message.")
+if image_mode:
+    st.caption("🎨 Image mode is ON: describe the picture you want.")
 
 # ---------------------------------------------------------------- show history
 for i, m in enumerate(st.session_state.history):
