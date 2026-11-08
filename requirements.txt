@@ -1,2 +1,8 @@
 streamlit
 google-genai
+pillow
+pypdf
+python-docx
+openpyxl
+python-pptx
+fpdf2
