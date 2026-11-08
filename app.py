@@ -1,41 +1,51 @@
 import io
 import os
+import time
 
 import streamlit as st
+from docx import Document
 from fpdf import FPDF
 from google import genai
 from google.genai import types
 from openpyxl import load_workbook
-from PIL import Image
 from pptx import Presentation
-from pypdf import PdfReader
-from docx import Document
 
-# ---------------------------------------------------------------- config
+# ---------------------------------------------------------------- settings
 CHAT_MODEL = "gemini-3.8-flash"
-IMAGE_MODEL = "gemini-2.5-flash-image"
-MAX_CHARS = 100_000  # cap on text pulled from one file
+FALLBACK_MODEL = "gemini-2.5-flash"  # used if the main model is busy
+MAX_CHARS = 100_000  # max text read from one file
 
 st.set_page_config(page_title="AssistU", page_icon="🎓")
 st.title("AssistU")
 st.caption("Your AI study assistant")
 
-
-def get_client():
-    key = None
-    try:
-        key = st.secrets["GEMINI_API_KEY"]
-    except Exception:
-        key = os.environ.get("GEMINI_API_KEY")
-    if not key:
-        st.error("API key not found. Add GEMINI_API_KEY to your Streamlit secrets.")
-        st.stop()
-    return genai.Client(api_key=key)
+try:
+    API_KEY = st.secrets["GEMINI_API_KEY"]
+except Exception:
+    API_KEY = os.environ.get("GEMINI_API_KEY")
+if not API_KEY:
+    st.error("API key not found. Add GEMINI_API_KEY to your Streamlit secrets.")
+    st.stop()
+client = genai.Client(api_key=API_KEY)
 
 
-client = get_client()
+def generate_with_retry(model, contents, config=None, fallback=None, tries=3):
+    """Retry when Google says the model is busy (503), then try a backup model."""
+    last_err = None
+    for m in [model] + ([fallback] if fallback else []):
+        for attempt in range(tries):
+            try:
+                return client.models.generate_content(model=m, contents=contents, config=config)
+            except Exception as e:
+                last_err = e
+                busy = "503" in str(e) or "UNAVAILABLE" in str(e)
+                if not busy:
+                    raise
+                time.sleep(2 * (attempt + 1))
+    raise last_err
 
-# ---------------------------------------------------------------- file reading
+
+# ---------------------------------------------------------------- reading files
 def read_docx(data: bytes) -> str:
     doc = Document(io.BytesIO(data))
     lines = [p.text for p in doc.paragraphs if p.text.strip()]
@@ -52,7 +62,7 @@ def read_xlsx(data: bytes) -> str:
         out.append(f"--- Sheet: {ws.title} ---")
         for i, row in enumerate(ws.iter_rows(values_only=True)):
             if i >= 1000:
-                out.append("... (more rows truncated)")
+                out.append("... (more rows not shown)")
                 break
             if any(c is not None for c in row):
                 out.append(" | ".join("" if c is None else str(c) for c in row))
@@ -76,7 +86,7 @@ def read_pptx(data: bytes) -> str:
 
 
 def build_parts(uploaded_files, camera_photo):
-    """Turn attachments into Gemini parts. Returns (parts, names, image_bytes_list)."""
+    """Turn attachments into Gemini parts. Returns (parts, names, images)."""
     parts, names, images = [], [], []
 
     for f in uploaded_files or []:
@@ -88,7 +98,7 @@ def build_parts(uploaded_files, camera_photo):
                 parts.append(types.Part.from_bytes(data=data, mime_type=mime))
                 images.append(data)
             elif ext == "pdf":
-                # Gemini reads PDFs natively (works for scanned PDFs too)
+                # Gemini reads PDFs directly (scanned PDFs work too)
                 parts.append(types.Part.from_bytes(data=data, mime_type="application/pdf"))
             else:
                 if ext == "docx":
@@ -97,10 +107,10 @@ def build_parts(uploaded_files, camera_photo):
                     text = read_xlsx(data)
                 elif ext == "pptx":
                     text = read_pptx(data)
-                else:  # txt, csv, md, py ...
+                else:  # txt, csv, md
                     text = data.decode("utf-8", errors="replace")
-                text = text[:MAX_CHARS]
-                parts.append(types.Part.from_text(text=f"[Contents of file: {f.name}]\n{text}"))
+                parts.append(types.Part.from_text(
+                    text=f"[Contents of file: {f.name}]\n{text[:MAX_CHARS]}"))
             names.append(f.name)
         except Exception as e:
             st.warning(f"Could not read {f.name}: {e}")
@@ -114,35 +124,19 @@ def build_parts(uploaded_files, camera_photo):
     return parts, names, images
 
 
-# ---------------------------------------------------------------- PDF creation
-def _latin(text: str) -> str:
-    # built-in PDF fonts only support latin-1
-    return text.encode("latin-1", "replace").decode("latin-1")
-
-
+# ---------------------------------------------------------------- PDF download
 def text_to_pdf(text: str, title: str = "AssistU reply") -> bytes:
+    def latin(t):  # built-in PDF fonts only support latin-1
+        return t.encode("latin-1", "replace").decode("latin-1")
+
     pdf = FPDF()
     pdf.set_auto_page_break(auto=True, margin=15)
     pdf.add_page()
     pdf.set_font("Helvetica", "B", 16)
-    pdf.multi_cell(0, 10, _latin(title))
+    pdf.multi_cell(0, 10, latin(title))
     pdf.ln(2)
     pdf.set_font("Helvetica", size=12)
-    pdf.multi_cell(0, 7, _latin(text.replace("**", "").replace("`", "")))
-    return bytes(pdf.output())
-
-
-def image_to_pdf(img_bytes: bytes) -> bytes:
-    img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-    buf = io.BytesIO()
-    img.save(buf, format="PNG")
-    buf.seek(0)
-    w, h = img.size
-    max_w, max_h = 190, 277
-    scale = min(max_w / w, max_h / h)
-    pdf = FPDF()
-    pdf.add_page()
-    pdf.image(buf, x=10, y=10, w=w * scale, h=h * scale)
+    pdf.multi_cell(0, 7, latin(text.replace("**", "").replace("`", "")))
     return bytes(pdf.output())
 
 
@@ -166,24 +160,16 @@ with st.expander("📎 Upload files  •  📷 Camera", expanded=False):
     if use_camera:
         photo = st.camera_input("Take a picture", key=f"cam_{st.session_state.uploader_key}")
 
-col_a, col_b = st.columns([3, 2])
-with col_a:
-    image_mode = st.toggle("🎨 Image generation mode",
-                           help="When on, your message is used as an image prompt. "
-                                "Attach a photo to edit it instead.")
-with col_b:
-    if st.button("🗑️ Clear chat", use_container_width=True):
-        st.session_state.history = []
-        st.session_state.uploader_key += 1
-        st.rerun()
+if st.button("🗑️ Clear chat"):
+    st.session_state.history = []
+    st.session_state.uploader_key += 1
+    st.rerun()
 
 n_attached = len(uploaded or []) + (1 if photo is not None else 0)
 if n_attached:
     st.info(f"📎 {n_attached} attachment(s) ready. They will be sent with your next message.")
-if image_mode:
-    st.caption("🎨 Image mode is ON: describe the picture you want.")
 
-# ---------------------------------------------------------------- show history
+# ---------------------------------------------------------------- show chat
 for i, m in enumerate(st.session_state.history):
     with st.chat_message("user" if m["role"] == "user" else "assistant"):
         for img in m["images"]:
@@ -192,20 +178,12 @@ for i, m in enumerate(st.session_state.history):
             st.caption("📎 " + ", ".join(m["files"]))
         if m["text"]:
             st.markdown(m["text"])
-        if m["role"] == "model":
-            c1, c2 = st.columns(2)
-            if m.get("generated"):
-                c1.download_button("⬇️ PNG", m["images"][0], file_name=f"assistu_{i}.png",
-                                   mime="image/png", key=f"png_{i}")
-                c2.download_button("⬇️ PDF", image_to_pdf(m["images"][0]),
-                                   file_name=f"assistu_{i}.pdf", mime="application/pdf",
-                                   key=f"pdfi_{i}")
-            elif m["text"]:
-                c1.download_button("⬇️ PDF", text_to_pdf(m["text"]),
-                                   file_name=f"assistu_reply_{i}.pdf",
-                                   mime="application/pdf", key=f"pdft_{i}")
+        if m["role"] == "model" and m["text"]:
+            st.download_button("⬇️ PDF", text_to_pdf(m["text"]),
+                               file_name=f"assistu_reply_{i}.pdf",
+                               mime="application/pdf", key=f"pdf_{i}")
 
-# ---------------------------------------------------------------- input
+# ---------------------------------------------------------------- chat input
 prompt = st.chat_input("Ask AssistU anything...")
 
 if prompt:
@@ -217,56 +195,37 @@ if prompt:
     })
 
     try:
-        if image_mode:
-            with st.spinner("Generating image..."):
-                resp = client.models.generate_content(
-                    model=IMAGE_MODEL,
-                    contents=[prompt] + [p for p in parts if p.inline_data is not None
-                                         and p.inline_data.mime_type.startswith("image/")],
-                    config=types.GenerateContentConfig(response_modalities=["TEXT", "IMAGE"]),
-                )
-            out_text, out_img = "", None
-            for part in resp.candidates[0].content.parts:
-                if part.text:
-                    out_text += part.text
-                elif part.inline_data:
-                    out_img = part.inline_data.data
-            if out_img:
-                st.session_state.history.append({
-                    "role": "model", "text": out_text, "files": [], "images": [out_img],
-                    "generated": True,
-                    "parts": [types.Part.from_text(text=f"[Generated an image for: {prompt}]")],
-                })
-            else:
-                reply = out_text or "I couldn't generate an image for that prompt."
-                st.session_state.history.append({
-                    "role": "model", "text": reply, "files": [], "images": [],
-                    "parts": [types.Part.from_text(text=reply)],
-                })
-        else:
-            contents = [types.Content(role=m["role"], parts=m["parts"])
-                        for m in st.session_state.history]
-            with st.spinner("Thinking..."):
-                resp = client.models.generate_content(
-                    model=CHAT_MODEL,
-                    contents=contents,
-                    config=types.GenerateContentConfig(
-                        system_instruction="You are AssistU, a friendly assistant for students. "
-                                           "Explain simply with examples. "
-                                           "When files or photos are attached, read them carefully "
-                                           "and answer based on their content."
-                    ),
-                )
-            reply = resp.text or "(no response)"
-            st.session_state.history.append({
-                "role": "model", "text": reply, "files": [], "images": [],
-                "parts": [types.Part.from_text(text=reply)],
-            })
+        contents = [types.Content(role=m["role"], parts=m["parts"])
+                    for m in st.session_state.history]
+        with st.spinner("Thinking..."):
+            resp = generate_with_retry(
+                model=CHAT_MODEL,
+                fallback=FALLBACK_MODEL,
+                contents=contents,
+                config=types.GenerateContentConfig(
+                    system_instruction="You are AssistU, a friendly assistant for students. "
+                                       "Explain simply with examples. "
+                                       "When files or photos are attached, read them carefully "
+                                       "and answer based on their content."
+                ),
+            )
+        reply = resp.text or "(no response)"
+        st.session_state.history.append({
+            "role": "model", "text": reply, "files": [], "images": [],
+            "parts": [types.Part.from_text(text=reply)],
+        })
     except Exception as e:
-        st.session_state.history.pop()  # drop the failed user turn
-        st.error(f"Something went wrong: {e}")
+        st.session_state.history.pop()  # remove the failed message
+        err = str(e)
+        if "429" in err or "RESOURCE_EXHAUSTED" in err:
+            st.warning("⏳ The free usage limit was reached. Please wait a few minutes "
+                       "(or until tomorrow) and try again.")
+        elif "503" in err or "UNAVAILABLE" in err:
+            st.warning("⚠️ Google's AI is very busy right now. Please try again in a minute.")
+        else:
+            st.error(f"Something went wrong: {e}")
         st.stop()
 
-    # reset the uploader/camera so attachments aren't re-sent next turn
+    # clear attachments so they are not sent again with the next message
     st.session_state.uploader_key += 1
     st.rerun()
