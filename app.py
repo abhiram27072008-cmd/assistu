@@ -2,6 +2,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import uuid
 
 import streamlit as st
@@ -11,19 +12,28 @@ from google import genai
 from google.genai import types
 from openpyxl import load_workbook
 from pptx import Presentation
+from pptx.dml.color import RGBColor
+from pptx.enum.shapes import MSO_SHAPE
+from pptx.enum.text import MSO_ANCHOR, PP_ALIGN
+from pptx.util import Inches, Pt
 from streamlit_js_eval import streamlit_js_eval
 
 # ---------------------------------------------------------------- settings
 CHAT_MODEL = "gemini-3.8-flash"
-FALLBACK_MODEL = "gemini-2.5-flash"  # used if the main model is busy
+FALLBACK_MODEL = "gemini-3.5-flash-lite"  # used if the main model is busy
 MAX_CHARS = 100_000  # max text read from one file
 STORAGE_KEY = "assistu_chats_v1"  # name of the saved data in the browser
 MAX_SAVED_BYTES = 4_000_000  # browser storage is small, keep under this
+SLIDES_PER_CALL = 5  # long presentations are written in small batches
 
 SYSTEM_PROMPT = ("You are AssistU, a friendly assistant for students. "
                  "Explain simply with examples. "
                  "When files or photos are attached, read them carefully "
                  "and answer based on their content.")
+DOC_SYSTEM = ("You are AssistU, helping a student create study material and presentations. "
+              "Be accurate, clear and well organised.")
+
+PPTX_MIME = "application/vnd.openxmlformats-officedocument.presentationml.presentation"
 
 st.set_page_config(page_title="AssistU", page_icon="🎓")
 st.title("AssistU")
@@ -39,11 +49,27 @@ if not API_KEY:
 client = genai.Client(api_key=API_KEY)
 
 
+def is_busy_or_missing(e) -> bool:
+    err = str(e)
+    return "503" in err or "UNAVAILABLE" in err or "404" in err or "NOT_FOUND" in err
+
+
+def show_error(e):
+    err = str(e)
+    if "429" in err or "RESOURCE_EXHAUSTED" in err:
+        st.warning("⏳ The free usage limit was reached. Please wait a few minutes "
+                   "(or until tomorrow) and try again.")
+    elif "503" in err or "UNAVAILABLE" in err:
+        st.warning("⚠️ Google's AI is very busy right now. Please try again in a minute.")
+    else:
+        st.error(f"Something went wrong: {e}")
+
+
 def stream_reply(contents):
     """Yield the answer piece by piece. If the main model is busy (503),
     switch to the backup model straight away."""
     config = types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT)
-    last_err = None
+    first_err = None
     for model in (CHAT_MODEL, FALLBACK_MODEL):
         started = False
         try:
@@ -54,11 +80,14 @@ def stream_reply(contents):
                     yield chunk.text
             return
         except Exception as e:
-            last_err = e
-            busy = "503" in str(e) or "UNAVAILABLE" in str(e)
-            if started or not busy:
-                raise
-    raise last_err
+            if first_err is None:
+                first_err = e
+            if started:
+                raise  # already showing text: cannot switch models now
+            if model == CHAT_MODEL and is_busy_or_missing(e):
+                continue  # main model busy or missing: try the backup
+            raise first_err
+    raise first_err
 
 
 # ---------------------------------------------------------------- reading files
@@ -140,21 +169,287 @@ def build_parts(uploaded_files, camera_photo):
     return parts, names, images
 
 
-# ---------------------------------------------------------------- PDF download
+# ---------------------------------------------------------------- PDF helpers
+PDF_REPLACE = {
+    "\u2018": "'", "\u2019": "'", "\u201c": '"', "\u201d": '"', "\u2013": "-", "\u2014": "-",
+    "\u2212": "-", "\u2022": "-", "\u2026": "...", "\u2192": "->", "\u2190": "<-",
+    "\u2248": "~", "\u2264": "<=", "\u2265": ">=", "\u2260": "!=", "\u00a0": " ",
+    "\u03c0": "pi", "\u03b1": "alpha", "\u03b2": "beta", "\u03b3": "gamma", "\u0394": "Delta",
+    "\u03bc": "mu", "\u03b8": "theta", "\u03bb": "lambda", "\u03c3": "sigma", "\u03a9": "Ohm",
+    "\u221e": "infinity", "\u221a": "sqrt", "\u2211": "sum", "\u2713": "[x]",
+}
+
+
+def pdf_safe(text: str) -> str:
+    """The built-in PDF fonts only know basic Latin letters, so swap common symbols."""
+    for old, new in PDF_REPLACE.items():
+        text = text.replace(old, new)
+    return text.encode("latin-1", "replace").decode("latin-1")
+
+
+def _line(pdf, height, text):
+    pdf.multi_cell(0, height, text, new_x="LMARGIN", new_y="NEXT")
+
+
 @st.cache_data(show_spinner=False)
 def text_to_pdf(text: str, title: str = "AssistU reply") -> bytes:
-    def latin(t):  # built-in PDF fonts only support latin-1
-        return t.encode("latin-1", "replace").decode("latin-1")
-
     pdf = FPDF()
     pdf.set_auto_page_break(auto=True, margin=15)
     pdf.add_page()
     pdf.set_font("Helvetica", "B", 16)
-    pdf.multi_cell(0, 10, latin(title))
+    _line(pdf, 10, pdf_safe(title))
     pdf.ln(2)
     pdf.set_font("Helvetica", size=12)
-    pdf.multi_cell(0, 7, latin(text.replace("**", "").replace("`", "")))
+    _line(pdf, 7, pdf_safe(text.replace("**", "").replace("`", "")))
     return bytes(pdf.output())
+
+
+def build_report_pdf(title, sections):
+    """sections = [(heading, body_text), ...]. Returns (pdf_bytes, page_count)."""
+    pdf = FPDF()
+    pdf.set_auto_page_break(auto=True, margin=18)
+    pdf.add_page()
+    pdf.set_font("Helvetica", "B", 24)
+    _line(pdf, 12, pdf_safe(title))
+    pdf.set_font("Helvetica", "I", 11)
+    _line(pdf, 8, "Created with AssistU")
+    for heading, body in sections:
+        pdf.ln(5)
+        pdf.set_font("Helvetica", "B", 16)
+        _line(pdf, 9, pdf_safe(heading))
+        pdf.ln(1)
+        for raw in body.replace("\r", "").split("\n"):
+            line = pdf_safe(raw.strip()).replace("**", "").replace("`", "")
+            if not line:
+                pdf.ln(2)
+            elif line.startswith("#"):
+                pdf.set_font("Helvetica", "B", 13)
+                _line(pdf, 7.5, line.lstrip("# ").strip())
+            elif line[:2] in ("- ", "* "):
+                pdf.set_font("Helvetica", "", 12)
+                pdf.set_x(pdf.l_margin + 5)
+                _line(pdf, 6.5, "- " + line[2:].strip())
+            else:
+                pdf.set_font("Helvetica", "", 12)
+                _line(pdf, 6.5, line)
+    pages = pdf.page_no()
+    return bytes(pdf.output()), pages
+
+
+# ---------------------------------------------------------------- PowerPoint builder
+NAVY = RGBColor(0x1F, 0x3A, 0x5F)
+ACCENT = RGBColor(0xF2, 0xA9, 0x1E)
+WHITE = RGBColor(0xFF, 0xFF, 0xFF)
+LIGHT = RGBColor(0xD6, 0xDE, 0xEA)
+DARK = RGBColor(0x2B, 0x2B, 0x2B)
+GREY = RGBColor(0x80, 0x80, 0x80)
+
+
+def _rect(slide, x, y, w, h, color):
+    shape = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, x, y, w, h)
+    shape.fill.solid()
+    shape.fill.fore_color.rgb = color
+    shape.line.fill.background()
+    return shape
+
+
+def _text(slide, x, y, w, h, text, size, color, bold=False, align=None, anchor=None):
+    box = slide.shapes.add_textbox(x, y, w, h)
+    tf = box.text_frame
+    tf.word_wrap = True
+    if anchor is not None:
+        tf.vertical_anchor = anchor
+    p = tf.paragraphs[0]
+    if align is not None:
+        p.alignment = align
+    run = p.add_run()
+    run.text = text
+    run.font.size = Pt(size)
+    run.font.bold = bold
+    run.font.color.rgb = color
+    return box
+
+
+def build_pptx(title, subtitle, slides) -> bytes:
+    """slides = [{"title", "bullets", "notes"}, ...] (the title slide is added first)."""
+    prs = Presentation()
+    prs.slide_width, prs.slide_height = Inches(13.333), Inches(7.5)
+    W, H = prs.slide_width, prs.slide_height
+    blank = prs.slide_layouts[6]
+
+    s = prs.slides.add_slide(blank)
+    _rect(s, 0, 0, W, H, NAVY)
+    _rect(s, Inches(0.9), Inches(4.0), Inches(2.2), Inches(0.08), ACCENT)
+    _text(s, Inches(0.9), Inches(1.4), W - Inches(1.8), Inches(2.5), title,
+          44 if len(title) < 50 else 34, WHITE, bold=True, anchor=MSO_ANCHOR.BOTTOM)
+    _text(s, Inches(0.9), Inches(4.3), W - Inches(1.8), Inches(1.2), subtitle, 22, LIGHT)
+
+    for number, sl in enumerate(slides, start=2):
+        s = prs.slides.add_slide(blank)
+        _rect(s, 0, 0, W, Inches(1.3), NAVY)
+        _rect(s, 0, Inches(1.3), W, Inches(0.06), ACCENT)
+        t = sl["title"]
+        _text(s, Inches(0.6), Inches(0.15), W - Inches(1.2), Inches(1.0), t,
+              30 if len(t) <= 45 else 24, WHITE, bold=True, anchor=MSO_ANCHOR.MIDDLE)
+
+        bullets = [b.replace("**", "").strip() for b in sl["bullets"] if b.strip()]
+        total = sum(len(b) for b in bullets)
+        size = 24 if total < 350 else 22 if total < 500 else 20 if total < 650 else 18 if total < 800 else 16
+        body = s.shapes.add_textbox(Inches(0.8), Inches(1.75), W - Inches(1.6), Inches(5.0))
+        tf = body.text_frame
+        tf.word_wrap = True
+        for j, b in enumerate(bullets):
+            p = tf.paragraphs[0] if j == 0 else tf.add_paragraph()
+            p.space_after = Pt(10)
+            run = p.add_run()
+            run.text = "\u2022  " + b
+            run.font.size = Pt(size)
+            run.font.color.rgb = DARK
+        _text(s, W - Inches(1.4), H - Inches(0.65), Inches(0.9), Inches(0.4), str(number),
+              12, GREY, align=PP_ALIGN.RIGHT)
+        if sl.get("notes"):
+            s.notes_slide.notes_text_frame.text = sl["notes"]
+
+    buf = io.BytesIO()
+    prs.save(buf)
+    return buf.getvalue()
+
+
+# ---------------------------------------------------------------- creating long PPTs / PDFs
+def gen(contents, json_mode=False):
+    """One Gemini call (not streamed). Tries the backup model if the main one is busy."""
+    kwargs = {"system_instruction": DOC_SYSTEM}
+    if json_mode:
+        kwargs["response_mime_type"] = "application/json"
+    config = types.GenerateContentConfig(**kwargs)
+    first_err = None
+    for model in (CHAT_MODEL, FALLBACK_MODEL):
+        try:
+            resp = client.models.generate_content(model=model, contents=contents, config=config)
+            return resp.text or ""
+        except Exception as e:
+            if first_err is None:
+                first_err = e
+            if model == CHAT_MODEL and is_busy_or_missing(e):
+                continue  # main model busy or missing: try the backup
+            raise first_err
+    raise first_err
+
+
+def parse_json(text):
+    t = re.sub(r"^```(?:json)?|```$", "", (text or "").strip(), flags=re.M).strip()
+    starts = [i for i in (t.find("{"), t.find("[")) if i != -1]
+    if not starts:
+        raise ValueError("The AI did not return a valid plan.")
+    end = max(t.rfind("}"), t.rfind("]"))
+    return json.loads(t[min(starts):end + 1])
+
+
+def gen_json(contents, tries=2):
+    last = None
+    for _ in range(tries):
+        try:
+            return parse_json(gen(contents, json_mode=True))
+        except ValueError as e:  # bad JSON: ask once more
+            last = e
+    raise last
+
+
+def safe_name(title, ext):
+    base = re.sub(r"[^A-Za-z0-9]+", "_", title).strip("_")[:40] or "AssistU"
+    return f"{base}.{ext}"
+
+
+def create_pptx(topic, n, src_parts, report):
+    def ask(prompt):
+        return src_parts + [types.Part.from_text(text=prompt)]
+
+    report(0.03, "Planning the slides...")
+    plan = gen_json(ask(
+        f"Plan a presentation about: {topic}\n"
+        f"Make exactly {n} slides, and the first one is the title slide. Write in the "
+        "same language as the topic. Return ONLY JSON like "
+        '{"title": "...", "subtitle": "...", "slides": [{"title": "..."}]} '
+        f"where slides lists all {n} slides in order."))
+    title = str(plan.get("title") or topic[:60])
+    subtitle = str(plan.get("subtitle") or "Created with AssistU")
+    titles = [str(s.get("title", "")) if isinstance(s, dict) else str(s)
+              for s in plan.get("slides", [])]
+    titles = (titles + [f"Slide {i + 1}" for i in range(len(titles), n)])[:n]
+
+    slides, partial, error = [], False, None
+    idxs = list(range(1, n))  # slide 0 is the title slide
+    try:
+        for b in range(0, len(idxs), SLIDES_PER_CALL):
+            chunk = idxs[b:b + SLIDES_PER_CALL]
+            report(0.08 + 0.87 * b / max(len(idxs), 1),
+                   f"Writing slides {chunk[0] + 1} to {chunk[-1] + 1} of {n}...")
+            items = gen_json(ask(
+                f'Presentation: "{title}" about {topic}.\n'
+                f"All slide titles in order: {json.dumps(titles)}.\n"
+                f"Write the content for slides {chunk[0] + 1} to {chunk[-1] + 1} only "
+                "(slide 1 is the title slide). For each slide give 4 to 6 bullet points of "
+                "at most 20 words each, factual and useful, plus 2 or 3 sentences of speaker "
+                f"notes. Return ONLY a JSON list with exactly {len(chunk)} items like "
+                '[{"title": "...", "bullets": ["..."], "notes": "..."}]'))
+            if isinstance(items, dict):
+                items = items.get("slides", [])
+            for k, i in enumerate(chunk):
+                it = items[k] if k < len(items) and isinstance(items[k], dict) else {}
+                slides.append({"title": str(it.get("title") or titles[i]),
+                               "bullets": [str(x) for x in it.get("bullets", [])][:8],
+                               "notes": str(it.get("notes", ""))})
+    except Exception as e:
+        if not slides:
+            raise
+        partial, error = True, e
+
+    report(0.97, "Building the PowerPoint file...")
+    return {"bytes": build_pptx(title, subtitle, slides), "title": title, "mime": PPTX_MIME,
+            "name": safe_name(title, "pptx"), "partial": partial, "error": error,
+            "count": len(slides) + 1, "total": n,
+            "outline": [titles[0]] + [s["title"] for s in slides]}
+
+
+def create_pdf_doc(topic, n, src_parts, report):
+    def ask(prompt):
+        return src_parts + [types.Part.from_text(text=prompt)]
+
+    report(0.03, "Planning the document...")
+    plan = gen_json(ask(
+        f"Plan a document about: {topic}\n"
+        f"It should be about {n} pages long. Return ONLY JSON like "
+        '{"title": "...", "sections": [{"heading": "...", "covers": "one sentence"}]} '
+        f"with exactly {n} sections in a logical order (introduction first, conclusion last). "
+        "Write in English."))
+    title = str(plan.get("title") or topic[:60])
+    secs = [s for s in plan.get("sections", []) if isinstance(s, dict)][:n] or \
+           [{"heading": "Overview", "covers": topic}]
+    headings = [str(s.get("heading", f"Section {i + 1}")) for i, s in enumerate(secs)]
+
+    done, partial, error = [], False, None
+    try:
+        for i, s in enumerate(secs):
+            report(0.08 + 0.87 * i / len(secs), f"Writing section {i + 1} of {len(secs)}...")
+            body = gen(ask(
+                f'Document: "{title}" about {topic}.\n'
+                f"All sections in order: {json.dumps(headings)}.\n"
+                f'Write ONLY section {i + 1}, "{headings[i]}" (it covers: {s.get("covers", "")}). '
+                "Length: about 350 words. Use plain text only: short paragraphs, and lines "
+                'starting with "- " for bullet points. Do not use markdown symbols like ** or #, '
+                "do not repeat the section heading, and use only simple English letters and "
+                "punctuation (write maths in words)."))
+            done.append((headings[i], body))
+    except Exception as e:
+        if not done:
+            raise
+        partial, error = True, e
+
+    report(0.97, "Building the PDF file...")
+    pdf_bytes, pages = build_report_pdf(title, done)
+    return {"bytes": pdf_bytes, "title": title, "mime": "application/pdf",
+            "name": safe_name(title, "pdf"), "partial": partial, "error": error,
+            "count": pages, "total": n, "outline": [h for h, _ in done]}
 
 
 # ---------------------------------------------------------------- saving chats in the browser
@@ -262,6 +557,10 @@ with st.sidebar:
 chat = st.session_state.chats[st.session_state.current]
 history = chat["history"]
 
+notice = st.session_state.pop("notice", None)
+if notice:
+    st.warning(notice)
+
 # ---------------------------------------------------------------- tools (main screen)
 with st.expander("📎 Upload files  •  📷 Camera", expanded=False):
     st.caption("Photos, PDF, Word (.docx), Excel (.xlsx), PowerPoint (.pptx), txt, csv")
@@ -276,6 +575,21 @@ with st.expander("📎 Upload files  •  📷 Camera", expanded=False):
     if use_camera:
         photo = st.camera_input("Take a picture", key=f"cam_{st.session_state.uploader_key}")
 
+with st.expander("📊 Create a PPT or PDF", expanded=False):
+    kind = st.radio("What do you want to create?", ["PowerPoint (PPT)", "PDF document"],
+                    horizontal=True)
+    topic = st.text_area("What should it be about?", height=100,
+                         key=f"topic_{st.session_state.uploader_key}",
+                         placeholder="Example: How solar panels work, for first-year students")
+    if kind.startswith("PowerPoint"):
+        amount = st.slider("Number of slides", 3, 40, 10)
+    else:
+        amount = st.slider("Approximate number of pages", 2, 25, 8)
+    st.caption("Tip: attach files in the box above to use them as the source. "
+               "Long ones take 1 to 3 minutes, so keep this page open. "
+               "PDFs support English letters only.")
+    make = st.button("✨ Create", type="primary")
+
 if st.button("🗑️ Clear this chat"):
     chat["history"] = []
     chat["title"] = "New chat"
@@ -286,6 +600,51 @@ n_attached = len(uploaded or []) + (1 if photo is not None else 0)
 if n_attached:
     st.info(f"📎 {n_attached} attachment(s) ready. They will be sent with your next message.")
 
+# ---------------------------------------------------------------- create PPT / PDF
+if make:
+    src_parts, src_names, _ = build_parts(uploaded, photo)
+    if not topic.strip() and not src_parts:
+        st.warning("✏️ Please type a topic first, or attach files to use as the source.")
+    else:
+        topic_text = topic.strip() or "the attached files"
+        bar = st.progress(0.0, text="Starting...")
+
+        def report(fraction, message):
+            bar.progress(min(max(fraction, 0.0), 1.0), text=message)
+
+        is_ppt = kind.startswith("PowerPoint")
+        try:
+            if is_ppt:
+                res = create_pptx(topic_text, amount, src_parts, report)
+            else:
+                res = create_pdf_doc(topic_text, amount, src_parts, report)
+        except Exception as e:
+            bar.empty()
+            show_error(e)
+            st.stop()
+        bar.empty()
+
+        what = "presentation" if is_ppt else "PDF"
+        unit = "slides" if is_ppt else "pages"
+        user_text = (f"Create a {amount}-{'slide PowerPoint' if is_ppt else 'page PDF'}: "
+                     f"{topic_text}")
+        reply_text = "\n".join(
+            [f"✅ Your {what} is ready: **{res['title']}** ({res['count']} {unit})", ""] +
+            [f"{i}. {t}" for i, t in enumerate(res["outline"], 1)])
+        history.append({"role": "user", "text": user_text, "files": src_names, "images": [],
+                        "parts": [types.Part.from_text(text=user_text)]})
+        history.append({"role": "model", "text": reply_text, "files": [res["name"]],
+                        "images": [], "parts": [types.Part.from_text(text=reply_text)],
+                        "file": {"name": res["name"], "bytes": res["bytes"], "mime": res["mime"]}})
+        if len(history) == 2:
+            chat["title"] = topic_text[:28] + ("…" if len(topic_text) > 28 else "")
+        if res["partial"]:
+            st.session_state.notice = (
+                f"⚠️ Stopped early ({res['error']}). Your file has {res['count']} of "
+                f"{res['total']} {unit}. Try again later for the full version.")
+        st.session_state.uploader_key += 1
+        st.rerun()
+
 # ---------------------------------------------------------------- show chat
 for i, m in enumerate(history):
     with st.chat_message("user" if m["role"] == "user" else "assistant"):
@@ -295,7 +654,11 @@ for i, m in enumerate(history):
             st.caption("📎 " + ", ".join(m["files"]))
         if m["text"]:
             st.markdown(m["text"])
-        if m["role"] == "model" and m["text"]:
+        if m.get("file"):
+            f = m["file"]
+            st.download_button(f"⬇️ Download {f['name']}", f["bytes"], file_name=f["name"],
+                               mime=f["mime"], key=f"file_{st.session_state.current}_{i}")
+        elif m["role"] == "model" and m["text"]:
             st.download_button("⬇️ PDF", text_to_pdf(m["text"]),
                                file_name=f"assistu_reply_{i}.pdf",
                                mime="application/pdf",
@@ -336,14 +699,7 @@ if prompt:
         history.pop()  # remove the failed message
         if not history:
             chat["title"] = "New chat"
-        err = str(e)
-        if "429" in err or "RESOURCE_EXHAUSTED" in err:
-            st.warning("⏳ The free usage limit was reached. Please wait a few minutes "
-                       "(or until tomorrow) and try again.")
-        elif "503" in err or "UNAVAILABLE" in err:
-            st.warning("⚠️ Google's AI is very busy right now. Please try again in a minute.")
-        else:
-            st.error(f"Something went wrong: {e}")
+        show_error(e)
         st.stop()
 
     # clear attachments so they are not sent again with the next message
